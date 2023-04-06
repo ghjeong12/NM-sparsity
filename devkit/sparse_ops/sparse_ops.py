@@ -3,7 +3,8 @@ from torch import autograd, nn
 import torch.nn.functional as F
 
 from itertools import repeat
-from torch._six import container_abcs
+#from torch._six import container_abcs
+import collections.abc as container_abcs
 
 
 class Sparse(autograd.Function):
@@ -64,11 +65,29 @@ class Sparse_NHWC(autograd.Function):
 
 class SparseConv(nn.Conv2d):
     """" implement N:M sparse convolution layer """
-    
+
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', N=2, M=4, **kwargs):
         self.N = N
         self.M = M
         super(SparseConv, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, padding_mode, **kwargs)
+
+
+    def get_sparse_inputs(self, x):
+
+        output = x.clone()
+        length = x.numel()
+        group = int(length/self.M)
+
+        weight_temp = x.detach().abs().permute(0,2,3,1).reshape(group, self.M)
+        index = torch.argsort(weight_temp, dim=1)[:, :int(self.M-self.N)]
+
+        w_b = torch.ones(weight_temp.shape, device=weight_temp.device)
+        w_b = w_b.scatter_(dim=1, index=index, value=0).reshape(x.permute(0,2,3,1).shape)
+        w_b = w_b.permute(0,3,1,2)
+
+        return output*w_b
+
+        #return Sparse_NHWC.apply(x, self.N, self.M)
 
 
     def get_sparse_weights(self):
@@ -78,8 +97,10 @@ class SparseConv(nn.Conv2d):
 
 
     def forward(self, x):
-
+        # UPDATED HERE BY Geonhwa
         w = self.get_sparse_weights()
+        #w = self.weight
+        #x = self.get_sparse_inputs(x)
         x = F.conv2d(
             x, w, self.bias, self.stride, self.padding, self.dilation, self.groups
         )
@@ -108,8 +129,8 @@ class SparseLinear(nn.Linear):
         return x
 
 
-    
 
-    
+
+
 
 

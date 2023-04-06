@@ -20,7 +20,12 @@ from devkit.core import (init_dist, broadcast_params, average_gradients, load_st
 from devkit.dataset.imagenet_dataset import ColorAugmentation, ImagenetDataset
 
 
-
+from torchvision.models import (
+    alexnet, vgg16, resnet18, resnet50, resnet101, resnet152, densenet121,
+    efficientnet_b0, efficientnet_b7, regnet_y_400mf, convnext_tiny,
+    convnext_small, convnext_base, convnext_large, mobilenet_v2,
+    mobilenet_v3_small, mobilenet_v3_large, vit_b_16, vit_b_32,
+    vit_l_16, vit_l_32)
 
 
 parser = argparse.ArgumentParser(
@@ -35,6 +40,7 @@ parser.add_argument('--model_dir', type=str)
 parser.add_argument('--resume_from', default='', help='resume_from')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
+parser.add_argument('--dense', type=bool)
 args = parser.parse_args()
 
 def main():
@@ -42,26 +48,37 @@ def main():
     args = parser.parse_args()
 
     with open(args.config) as f:
-        config = yaml.load(f)
+        print(f)
+        config = yaml.safe_load(f)
 
     for key in config:
         for k, v in config[key].items():
             setattr(args, k, v)
 
     print('Enabled distributed training.')
+    print('Port')
+    print(args.port)
 
-    rank, world_size = init_dist(
-        backend='nccl', port=args.port)
-    args.rank = rank
-    args.world_size = world_size
 
+    #rank, world_size = init_dist(
+    #    backend='nccl', port=args.port)
+    #args.rank = rank
+    #args.world_size = world_size
+    rank = args.rank
     # create model
     print("=> creating model '{}'".format(args.model))
-    model = models.__dict__[args.model](N = args.N, M = args.M)
+
+    model = None
+    if args.dense:
+        model = resnet18(pretrained=False)
+        print("Dense model")
+    else:
+        print("Sparse model")
+        model = models.__dict__[args.model](N = args.N, M = args.M)
 
 
     model.cuda()
-    broadcast_params(model)
+    #broadcast_params(model)
     print(model)
 
     # define loss function (criterion) and optimizer
@@ -88,7 +105,8 @@ def main():
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
-
+    print(args.train_root)
+    print(args.train_source)
     train_dataset = ImagenetDataset(
         args.train_root,
         args.train_source,
@@ -109,16 +127,16 @@ def main():
             normalize,
         ]))
 
-    train_sampler = DistributedSampler(train_dataset)
-    val_sampler = DistributedSampler(val_dataset)
+    #train_sampler = DistributedSampler(train_dataset)
+    #val_sampler = DistributedSampler(val_dataset)
 
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size//args.world_size, shuffle=False,
-        num_workers=args.workers, pin_memory=False, sampler=train_sampler)
+        train_dataset, batch_size=args.batch_size//args.world_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, sampler=None)
 
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size//args.world_size, shuffle=False,
-        num_workers=args.workers, pin_memory=False, sampler=val_sampler)
+        num_workers=args.workers, pin_memory=False, sampler=None)
 
     if args.evaluate:
         validate(val_loader, model, criterion, 0, writer)
@@ -129,7 +147,7 @@ def main():
     lr_scheduler = LRScheduler(optimizer, niters, args)
 
     for epoch in range(start_epoch, args.epochs):
-        train_sampler.set_epoch(epoch)
+        #train_sampler.set_epoch(epoch)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, lr_scheduler, epoch, writer)
@@ -148,7 +166,50 @@ def main():
                 'best_prec1': best_prec1,
                 'optimizer': optimizer.state_dict(),
             }, is_best)
+def train_single(train_loader, model, criterion, optimizer, epoch, device, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
 
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (images, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        # move data to the same device as model
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        # compute output
+        output = model(images)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i + 1)
 def train(train_loader, model, criterion, optimizer, lr_scheduler, epoch, writer):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -181,9 +242,9 @@ def train(train_loader, model, criterion, optimizer, lr_scheduler, epoch, writer
         reduced_prec1 = prec1.clone() / world_size
         reduced_prec5 = prec5.clone() / world_size
 
-        dist.all_reduce_multigpu([reduced_loss])
-        dist.all_reduce_multigpu([reduced_prec1])
-        dist.all_reduce_multigpu([reduced_prec5])
+        #dist.all_reduce_multigpu([reduced_loss])
+        #dist.all_reduce_multigpu([reduced_prec1])
+        #dist.all_reduce_multigpu([reduced_prec5])
 
         losses.update(reduced_loss.item(), input.size(0))
         top1.update(reduced_prec1.item(), input.size(0))
@@ -192,7 +253,7 @@ def train(train_loader, model, criterion, optimizer, lr_scheduler, epoch, writer
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-        average_gradients(model)
+        #average_gradients(model)
         optimizer.step()
 
         # measure elapsed time
@@ -244,9 +305,9 @@ def validate(val_loader, model, criterion, epoch, writer):
             reduced_prec1 = prec1.clone() / world_size
             reduced_prec5 = prec5.clone() / world_size
 
-            dist.all_reduce_multigpu([reduced_loss])
-            dist.all_reduce_multigpu([reduced_prec1])
-            dist.all_reduce_multigpu([reduced_prec5])
+            #dist.all_reduce_multigpu([reduced_loss])
+            #dist.all_reduce_multigpu([reduced_prec1])
+            #dist.all_reduce_multigpu([reduced_prec5])
 
             losses.update(reduced_loss.item(), input.size(0))
             top1.update(prec1.item(), input.size(0))
@@ -304,7 +365,7 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
